@@ -1225,6 +1225,81 @@ O resultado correto, por si só, não é suficiente para provar qual ferramenta 
 
 ---
 
+# Claude Command Session — Comando `commit`
+
+## Objetivo
+
+Documentar o funcionamento do comando `commit`, uma Skill nativa do Claude Code utilizada para criar commits com mensagens geradas automaticamente, seguindo a convenção já existente no histórico do repositório.
+
+## Como o comando funciona
+
+O comando `commit` segue um fluxo interno definido pela sua Skill:
+
+1. **Descoberta da convenção de commits**
+
+    ```bash
+    git log --oneline -20
+    git log --oneline --author="$(git config user.name)" -10
+    ```
+
+    O Claude analisa o histórico geral e o histórico do próprio usuário para identificar o padrão utilizado (Conventional Commits, Gitmoji, prefixo de ticket, livre, etc).
+
+2. **Verificação do status do repositório**
+
+    ```bash
+    git status --short
+    ```
+
+    -   Working tree limpo → informa o usuário e para.
+    -   Já existem alterações staged → utiliza apenas o que está staged.
+    -   Existem apenas alterações unstaged → executa `git add -A` e utiliza tudo.
+
+3. **Geração da mensagem de commit**
+
+    ```bash
+    git diff --cached --stat
+    git diff --cached
+    ```
+
+    A partir do diff e da convenção detectada, o Claude gera:
+
+    -   subject line (≤ 72 caracteres);
+    -   body opcional, explicando o *porquê* da mudança quando não trivial;
+    -   referência a issues/tickets quando presentes no nome da branch ou no contexto.
+
+4. **Execução do commit**
+
+    ```bash
+    git commit -m "<subject>" -m "<body>"
+    ```
+
+5. **Confirmação**
+
+    ```bash
+    git status --short
+    git log --oneline -1
+    ```
+
+    Caso hooks (por exemplo, `pre-commit`) alterem arquivos ou bloqueiem o commit, o Claude reporta exatamente o que aconteceu, sem realizar `amend` automaticamente.
+
+## Salvaguardas do comando
+
+-   Nunca faz `amend` em commits existentes sem perguntar.
+-   Nunca faz `push` ou `force-push` sem aprovação explícita.
+-   Nunca pula hooks (`--no-verify`) nem assinatura (`--no-gpg-sign`).
+-   Nunca reverte, reseta ou descarta alterações do usuário, a não ser que isso tenha sido explicitamente solicitado.
+-   Em caso de dúvida sobre staging, convenção ou conteúdo da mensagem, o Claude pergunta ao usuário.
+
+## Relação com o laboratório
+
+Neste projeto, o comando `commit` cuida apenas da criação do commit local. A verificação de segredos ocorre em um momento posterior e separado, através do hook `.githooks/pre-push`, que executa `gitleaks detect` e bloqueia o `push` caso encontre segredos. As duas etapas são conceitualmente distintas: o comando `commit` versiona a alteração; o hook `pre-push` audita o que está prestes a sair do ambiente local.
+
+### Status
+
+Documentado — não é um checkpoint numerado do laboratório, mas parte do ferramental do Claude Code utilizado a partir do Cenário 3.
+
+---
+
 # Próximo passo — Checkpoint 3.3
 
 O próximo objetivo será permitir que o Claude trabalhe efetivamente com o conteúdo versionado no GitHub.
