@@ -1132,3 +1132,123 @@ O objetivo final não é simplesmente "usar IA para escrever Terraform".
 
 É entender como um Agent pode **utilizar ferramentas e processos de
 engenharia de forma segura, reproduzível e governada**.
+
+
+---
+
+# Cenário 3 — GitHub MCP
+
+## Objetivo
+
+Introduzir o GitHub como parte do ambiente de trabalho do Agent.
+
+O objetivo é permitir que o Claude Code interaja com o repositório do laboratório através do GitHub MCP.
+
+Fluxo inicial:
+
+```text
+Claude Code
+     ↓
+GitHub MCP Server
+     ↓
+GitHub API
+     ↓
+Repository
+```
+
+---
+
+# Checkpoint 3.1 — GitHub MCP conectado
+
+Inicialmente foi verificado que o GitHub MCP não estava configurado para o projeto.
+
+Foi configurado o **GitHub MCP Server** utilizando um Personal Access Token (PAT) armazenado em variável de ambiente.
+
+O token não é armazenado no repositório nem no README.
+
+Validação:
+
+```text
+github ✓ Connected
+```
+
+O Claude Code passou a apresentar os seguintes MCPs conectados:
+
+```text
+context7      ✓ Connected
+aws-mcp       ✓ Connected
+terraform     ✓ Connected
+github        ✓ Connected
+```
+
+### Status
+
+**Checkpoint 3.1 — OK**
+
+---
+
+# Checkpoint 3.2 — Claude → GitHub Read-Only
+
+Foi realizado o primeiro teste de interação com o repositório através do GitHub MCP.
+
+Solicitação ao Claude:
+
+```text
+Inspect the GitHub repository for this project. Tell me its repository name, default branch, current files, and the latest commit. Do not modify anything.
+```
+
+O Claude conseguiu consultar o repositório e retornar suas informações sem realizar alterações.
+
+Fluxo validado:
+
+```text
+User
+ ↓
+Claude Code
+ ↓
+GitHub MCP
+ ↓
+GitHub API
+ ↓
+Repository information
+```
+
+### Descoberta importante
+
+Assim como no Terraform MCP, a confirmação de que o MCP foi efetivamente utilizado deve ser feita observando as **Tool Calls** realizadas pelo Agent, e não apenas pelo resultado final.
+
+O resultado correto, por si só, não é suficiente para provar qual ferramenta foi utilizada.
+
+### Status
+
+**Checkpoint 3.2 — OK**
+
+---
+
+# Próximo passo — Checkpoint 3.3
+
+O próximo objetivo será permitir que o Claude trabalhe efetivamente com o conteúdo versionado no GitHub.
+
+Primeiro exercício planejado:
+
+```text
+Inspect the README.md in the GitHub repository and identify
+what has changed since the current local project version.
+Do not modify anything.
+```
+
+Depois disso, o laboratório evoluirá para operações controladas de escrita:
+
+```text
+Claude
+  ↓
+GitHub MCP
+  ↓
+GitHub
+  ↓
+Commit / Branch / Pull Request
+```
+
+Ainda não será introduzido GitHub Actions.
+
+O objetivo primeiro é entender claramente como o Agent interage com o repositório antes de transformar o GitHub em parte do fluxo de CI/CD.
