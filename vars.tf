@@ -9,3 +9,10 @@ variable "aws_region" {
   type        = string
   default     = "us-east-1"
 }
+
+variable "terraform_version" {
+  description = "Terraform version for the S3 bucket"
+  type        = string
+  default     = "1.0.0"
+}
+
