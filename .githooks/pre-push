@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Blocks `git push` if gitleaks finds secrets anywhere in the repo history/working tree.
+# Activate with: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-push: gitleaks not found in PATH — install it (e.g. 'sudo apt install gitleaks') before pushing." >&2
+  exit 1
+fi
+
+echo "pre-push: running gitleaks secret scan..."
+gitleaks detect --source "$(git rev-parse --show-toplevel)" --redact --no-banner
