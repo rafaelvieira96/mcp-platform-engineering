@@ -1072,6 +1072,7 @@ de IaC.
 -   [x] Repositório Terraform
 -   [x] GitHub Actions
 -   [x] OIDC GitHub Actions → AWS (role + provider criados; workflow ainda não conectado)
+-   [x] Estado remoto (S3 backend)
 -   [ ] Pipeline Terraform
 -   [ ] Agent → Pull Request
 -   [ ] Agent → Pipeline
@@ -1386,6 +1387,43 @@ O workflow `.github/workflows/terraform.yml` **não foi alterado** neste checkpo
 
 -   [ ] Criar o GitHub Environment `aws-plan` (Settings → Environments) com revisor obrigatório configurado.
 -   [ ] Adicionar `permissions: id-token: write`, `environment: aws-plan` e um step `aws-actions/configure-aws-credentials` (`role-to-assume` apontando para a role acima) no workflow.
+
+---
+
+# Checkpoint 3.5 — Estado remoto (S3 backend)
+
+Até este ponto, o estado do Terraform era local (`terraform.tfstate`, sempre no `.gitignore`, nunca versionado). Isso também era a razão pela qual o workflow de CI rodava com `terraform init -backend=false`: não havia nenhum backend remoto para configurar.
+
+### Bucket dedicado para o estado
+
+Foi criado um novo arquivo `state_backend.tf` com um bucket S3 dedicado exclusivamente ao estado do Terraform (`mcp-platform-engineering-tfstate-<account-id>`, nome único via `data.aws_caller_identity`, sem o account ID aparecer no código-fonte), com configurações de segurança apropriadas para um bucket de estado:
+
+-   Versionamento habilitado (permite recuperar versões anteriores do state).
+-   Criptografia server-side (SSE-S3/AES256).
+-   `aws_s3_bucket_ownership_controls` com `BucketOwnerEnforced` (ACLs desabilitadas).
+-   Bloqueio total de acesso público (`aws_s3_bucket_public_access_block`).
+-   Política do bucket negando qualquer requisição fora de TLS (`aws:SecureTransport = false`).
+-   Lifecycle expirando versões não-atuais após 90 dias, para o histórico de versões não crescer indefinidamente.
+
+`terraform plan` e `apply` rodaram normalmente (ainda usando o backend local nesse momento) — 7 recursos criados, 0 alterados, 0 destruídos.
+
+### Backend block e migração de estado
+
+Como blocos `backend` do Terraform não aceitam variáveis, data sources ou referências a outros recursos (precisam ser literais, resolvidos antes de qualquer outra avaliação), o nome do bucket não podia vir de `data.aws_caller_identity` dentro do próprio bloco `backend` — e escrevê-lo como string literal em `main.tf` colocaria o account ID em um arquivo versionado, o que viola a convenção deste repositório.
+
+Solução adotada: configuração parcial de backend. `main.tf` ganhou apenas `backend "s3" {}` (vazio, genérico), e os valores reais (`bucket`, `key`, `region`, `encrypt`, `use_lockfile`) foram colocados em um novo arquivo `backend.hcl`, adicionado ao `.gitignore` — o account ID nunca chega a um arquivo versionado.
+
+```text
+terraform init -backend-config=backend.hcl -migrate-state
+```
+
+O `required_version` em `main.tf` foi elevado de `>= 1.5` para `>= 1.10`, necessário para `use_lockfile = true` — o locking nativo do backend S3 (Terraform 1.10+), que dispensa uma tabela DynamoDB separada só para locks.
+
+A migração copiou o state local existente para o S3 sem tocar em nenhum recurso real da AWS. Confirmado com `terraform plan` pós-migração: **"No changes. Your infrastructure matches the configuration."** — todos os 14 recursos até então gerenciados (bucket da aplicação, bucket de estado, OIDC provider, role e policy do GitHub Actions) permaneceram rastreados com os mesmos IDs.
+
+### Status
+
+**Checkpoint 3.5 — OK.** Pendência conhecida: o workflow `.github/workflows/terraform.yml` ainda roda com `terraform init -backend=false` e a policy da role `gh-actions-terraform-plan` só tem leitura sobre o bucket da aplicação — para o pipeline usar de fato este backend remoto, o workflow precisa passar a inicializar com o backend real, e a policy da role precisa ganhar leitura sobre o bucket de estado também.
 
 ---
 
