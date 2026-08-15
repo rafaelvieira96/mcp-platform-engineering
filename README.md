@@ -1068,9 +1068,10 @@ de IaC.
 
 ## Cenário 3 --- Pipeline
 
--   [ ] GitHub MCP
--   [ ] Repositório Terraform
--   [ ] GitHub Actions
+-   [x] GitHub MCP
+-   [x] Repositório Terraform
+-   [x] GitHub Actions
+-   [x] OIDC GitHub Actions → AWS (role + provider criados; workflow ainda não conectado)
 -   [ ] Pipeline Terraform
 -   [ ] Agent → Pull Request
 -   [ ] Agent → Pipeline
@@ -1300,11 +1301,97 @@ Documentado — não é um checkpoint numerado do laboratório, mas parte do fer
 
 ---
 
-# Próximo passo — Checkpoint 3.3
+# Checkpoint 3.3 — GitHub Actions (fora de ordem)
 
-O próximo objetivo será permitir que o Claude trabalhe efetivamente com o conteúdo versionado no GitHub.
+O roadmap original previa que o Checkpoint 3.3 fosse um exercício somente leitura (inspecionar o `README.md` no GitHub e identificar diferenças, sem modificar nada) e que o GitHub Actions só seria introduzido depois disso.
 
-Primeiro exercício planejado:
+Por decisão explícita do usuário, esse passo foi antecipado: o pipeline de CI foi criado antes do exercício read-only planejado. Fica registrado aqui que a ordem do roadmap foi quebrada conscientemente, não por omissão do Agent.
+
+Solicitação ao Claude:
+
+```text
+Create a GitHub Actions workflow for this Terraform project. The workflow
+should run on pull requests that modify Terraform files. It must checkout
+the repository, install/setup Terraform, run terraform init with a local
+backend disabled, terraform fmt -check, terraform validate, and terraform
+plan. Do not run terraform apply. Do not modify any AWS resources.
+```
+
+Foi criado `.github/workflows/terraform.yml`, disparado em `pull_request` quando arquivos `**.tf` são alterados:
+
+```text
+checkout → setup-terraform → terraform init -backend=false
+  → terraform fmt -check -recursive → terraform validate
+  → (auth AWS) → terraform plan
+```
+
+Pontos importantes:
+
+-   `terraform init -backend=false`: nenhum backend remoto está configurado neste projeto (o estado local, `terraform.tfstate`, está no `.gitignore` e nunca é versionado), então o `init` do workflow não tenta configurar nenhum backend — apenas baixa os providers.
+-   O workflow **nunca** executa `terraform apply`. `terraform plan` é somente leitura em relação ao estado do Terraform, mas ainda faz chamadas de leitura à API da AWS.
+-   Autenticação com a AWS: por decisão do usuário, o workflow **não** usa credenciais IAM de longa duração (access key / secret key) por questão de segurança. A etapa de autenticação foi deixada como um placeholder (`# AWS auth (OIDC role assumption) goes here — set up separately.`) — o usuário vai configurar OIDC (assunção de role via `id-token: write` + `aws-actions/configure-aws-credentials` com `role-to-assume`) fora deste passo do Claude.
+-   `fmt -check` e `validate` foram validados localmente contra `main.tf` / `vars.tf` antes do commit, sem necessidade de credenciais AWS.
+
+### Status
+
+**Checkpoint 3.3 — OK (executado fora da ordem original do roadmap, por escolha do usuário)**
+
+---
+
+# Checkpoint 3.4 — OIDC GitHub Actions → AWS
+
+Antes de implementar qualquer coisa, o Claude inspecionou o repositório GitHub e a conta AWS relevantes para a configuração de OIDC:
+
+-   **GitHub**: repositório `rafaelvieira96/mcp-platform-engineering`, **público**, branch padrão `main`, com `pull_request_creation_policy: "all"` — ou seja, qualquer pessoa pode abrir PR, inclusive a partir de forks.
+-   **AWS**: nenhum OIDC provider para `token.actions.githubusercontent.com` existia (havia apenas um provider OIDC não relacionado, de um cluster EKS). Nenhuma role de IAM relacionada a GitHub/Actions/OIDC existia. As credenciais atuais em uso (`claude-user`) têm `AdministratorAccess`, o que reforçou a necessidade de criar uma role nova e estritamente limitada, em vez de reaproveitar credenciais amplas.
+
+### Descoberta importante — risco de PR de fork
+
+Como o repositório é público e aceita PR de qualquer fork, e o workflow dispara em `pull_request`, a claim `sub` emitida pelo GitHub para esse tipo de evento (`repo:OWNER/REPO:pull_request`) **não distingue PR de fork de PR do próprio dono**. Confiar diretamente nessa claim permitiria que qualquer pessoa, ao abrir um PR, obtivesse credenciais AWS.
+
+Mitigação adotada: a trust policy não confia na claim `pull_request`, e sim na claim `environment`, que só é emitida quando o job declara `environment: aws-plan`. Um **GitHub Environment protegido por revisor obrigatório** desacopla "quem pode abrir PR" (qualquer pessoa) de "quem pode obter credenciais AWS" (só após aprovação humana).
+
+### Recursos AWS criados
+
+Arquivo novo `github_actions_oidc.tf`, mais um ajuste em `main.tf` (`required_providers` ganhou `hashicorp/tls`, necessário para o `data "tls_certificate"` que busca o thumbprint do certificado do GitHub dinamicamente em vez de um valor fixo).
+
+```text
+data.tls_certificate.github_actions
+  → aws_iam_openid_connect_provider.github_actions
+      → aws_iam_role.gh_actions_terraform_plan
+          → aws_iam_role_policy.terraform_plan_s3_read_only
+```
+
+-   **`aws_iam_openid_connect_provider.github_actions`** — provider OIDC para `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`. O thumbprint foi resolvido dinamicamente via `data.tls_certificate` (o valor obtido, `ab9d0263244dd0326eb67015705a667e79cfe998`, diverge do valor estático comumente citado em tutoriais — confirmando que fixar esse valor manualmente seria arriscado).
+-   **`aws_iam_role.gh_actions_terraform_plan`** (ARN: `arn:aws:iam::XXXXXXXXXXXX:role/gh-actions-terraform-plan`) — trust policy restrita por `Federated` (o ARN do provider acima), `aud = sts.amazonaws.com`, e `sub = repo:rafaelvieira96/mcp-platform-engineering:environment:aws-plan` (todas via `StringEquals`, sem wildcard).
+-   **`aws_iam_role_policy.terraform_plan_s3_read_only`** — policy inline, somente leitura, com seis ações (`GetBucketLocation`, `GetBucketPolicy`, `GetBucketPublicAccessBlock`, `GetLifecycleConfiguration`, `GetBucketTagging`, `ListBucket`), restritas ao ARN do bucket `my-mcp-terraform-test-part2`. Nenhuma ação de escrita/exclusão.
+
+### Ajuste durante a implementação
+
+O plano original pedia `max_session_duration = 900`. O `terraform plan` rejeitou esse valor: a AWS exige que esse atributo da role esteja entre **3600 e 43200 segundos** (900s só é válido como `role-duration-seconds` na hora de assumir a role via `aws-actions/configure-aws-credentials`, não como teto da role). Usuário confirmou o uso do piso permitido pela AWS, `3600`.
+
+### Fluxo validado
+
+```text
+terraform init → terraform plan (mostrado ao usuário) → aprovação → terraform apply
+```
+
+`terraform plan` rodou como somente leitura (fez apenas refresh dos recursos S3 já existentes, sem alterá-los) antes de qualquer `apply`. `terraform apply` criou exatamente os 3 recursos planejados, 0 alterados, 0 destruídos.
+
+O workflow `.github/workflows/terraform.yml` **não foi alterado** neste checkpoint — a role existe na AWS, mas ainda não é utilizável pelo pipeline.
+
+### Status
+
+**Checkpoint 3.4 — OK.** Pendências para o pipeline realmente usar essa role:
+
+-   [ ] Criar o GitHub Environment `aws-plan` (Settings → Environments) com revisor obrigatório configurado.
+-   [ ] Adicionar `permissions: id-token: write`, `environment: aws-plan` e um step `aws-actions/configure-aws-credentials` (`role-to-assume` apontando para a role acima) no workflow.
+
+---
+
+# Próximo passo
+
+O exercício read-only originalmente planejado para o Checkpoint 3.3 ainda não foi feito e pode ser retomado a qualquer momento:
 
 ```text
 Inspect the README.md in the GitHub repository and identify
@@ -1312,7 +1399,7 @@ what has changed since the current local project version.
 Do not modify anything.
 ```
 
-Depois disso, o laboratório evoluirá para operações controladas de escrita:
+Depois disso, o laboratório segue para operações controladas de escrita via GitHub MCP:
 
 ```text
 Claude
@@ -1324,6 +1411,4 @@ GitHub
 Commit / Branch / Pull Request
 ```
 
-Ainda não será introduzido GitHub Actions.
-
-O objetivo primeiro é entender claramente como o Agent interage com o repositório antes de transformar o GitHub em parte do fluxo de CI/CD.
+E, em seguida, para o restante do Cenário 3 (Pipeline Terraform completo, Agent → Pull Request, Agent → Pipeline, Plan automático).
