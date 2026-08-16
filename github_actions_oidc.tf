@@ -67,3 +67,33 @@ resource "aws_iam_role_policy" "terraform_plan_s3_read_only" {
     ]
   })
 }
+
+resource "aws_iam_role_policy" "terraform_plan_state_read_only" {
+  name = "terraform-plan-state-read-only"
+  role = aws_iam_role.gh_actions_terraform_plan.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "TerraformPlanStateBucketReadOnly"
+        Effect = "Allow"
+        Action = [
+          "s3:GetBucketLocation",
+          "s3:ListBucket",
+        ]
+        Resource = aws_s3_bucket.terraform_state.arn
+      },
+      {
+        Sid    = "TerraformPlanStateObjectReadOnly"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+        ]
+        # terraform plan -lock=false never touches the lockfile object, so
+        # this is scoped to the state object itself, not the whole bucket.
+        Resource = "${aws_s3_bucket.terraform_state.arn}/mcp-platform-engineering/terraform.tfstate"
+      }
+    ]
+  })
+}
