@@ -40,5 +40,14 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: us-east-1
 
+      - name: Terraform Init (S3 backend)
+        run: |
+          terraform init -reconfigure -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=mcp-platform-engineering/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
       - name: Terraform Plan
         run: terraform plan -input=false -lock=false
