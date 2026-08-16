@@ -1,3 +1,29 @@
+locals {
+  # aws_s3_bucket's Read() probes this full set of bucket attributes
+  # regardless of which dedicated sub-resources (versioning, lifecycle,
+  # etc.) are actually declared against the bucket, so terraform plan
+  # needs all of these on every bucket it refreshes, not just the ones
+  # matching declared sub-resources.
+  s3_bucket_metadata_read_actions = [
+    "s3:GetAccelerateConfiguration",
+    "s3:GetBucketAcl",
+    "s3:GetBucketCORS",
+    "s3:GetBucketLocation",
+    "s3:GetBucketLogging",
+    "s3:GetBucketObjectLockConfiguration",
+    "s3:GetBucketPolicy",
+    "s3:GetBucketPublicAccessBlock",
+    "s3:GetBucketRequestPayment",
+    "s3:GetBucketTagging",
+    "s3:GetBucketVersioning",
+    "s3:GetBucketWebsite",
+    "s3:GetEncryptionConfiguration",
+    "s3:GetLifecycleConfiguration",
+    "s3:GetReplicationConfiguration",
+    "s3:ListBucket",
+  ]
+}
+
 data "tls_certificate" "github_actions" {
   url = "https://token.actions.githubusercontent.com"
 }
@@ -52,17 +78,9 @@ resource "aws_iam_role_policy" "terraform_plan_s3_read_only" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "TerraformPlanS3ReadOnly"
-        Effect = "Allow"
-        Action = [
-          "s3:GetBucketAcl",
-          "s3:GetBucketLocation",
-          "s3:GetBucketPolicy",
-          "s3:GetBucketPublicAccessBlock",
-          "s3:GetLifecycleConfiguration",
-          "s3:GetBucketTagging",
-          "s3:ListBucket",
-        ]
+        Sid      = "TerraformPlanS3ReadOnly"
+        Effect   = "Allow"
+        Action   = local.s3_bucket_metadata_read_actions
         Resource = aws_s3_bucket.this.arn
       }
     ]
@@ -84,18 +102,10 @@ resource "aws_iam_role_policy" "terraform_plan_state_read_only" {
         # those resource types' AWS provider Read() calls.
         Sid    = "TerraformPlanStateBucketReadOnly"
         Effect = "Allow"
-        Action = [
-          "s3:GetBucketAcl",
-          "s3:GetBucketLocation",
-          "s3:GetBucketOwnershipControls",
-          "s3:GetBucketPolicy",
-          "s3:GetBucketPublicAccessBlock",
-          "s3:GetBucketTagging",
-          "s3:GetBucketVersioning",
-          "s3:GetEncryptionConfiguration",
-          "s3:GetLifecycleConfiguration",
-          "s3:ListBucket",
-        ]
+        # Adds GetBucketOwnershipControls on top of the shared bucket
+        # metadata actions, for aws_s3_bucket_ownership_controls.terraform_state
+        # (the app bucket has no equivalent resource).
+        Action   = concat(local.s3_bucket_metadata_read_actions, ["s3:GetBucketOwnershipControls"])
         Resource = aws_s3_bucket.terraform_state.arn
       },
       {
@@ -134,6 +144,8 @@ resource "aws_iam_role_policy" "terraform_plan_iam_self_read_only" {
         Action = [
           "iam:GetRole",
           "iam:GetRolePolicy",
+          "iam:ListAttachedRolePolicies",
+          "iam:ListRolePolicies",
         ]
         Resource = aws_iam_role.gh_actions_terraform_plan.arn
       }
