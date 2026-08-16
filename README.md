@@ -1071,12 +1071,13 @@ de IaC.
 -   [x] GitHub MCP
 -   [x] Repositório Terraform
 -   [x] GitHub Actions
--   [x] OIDC GitHub Actions → AWS (role + provider criados; workflow ainda não conectado)
--   [x] Estado remoto (S3 backend)
--   [ ] Pipeline Terraform
--   [ ] Agent → Pull Request
--   [ ] Agent → Pipeline
--   [ ] Plan automático
+-   [x] OIDC GitHub Actions → AWS (role, provider e workflow conectados e funcionando; ver Checkpoint 3.6)
+-   [x] Estado remoto (S3 backend), incluindo inicialização real no pipeline de CI (Checkpoint 3.7)
+-   [x] IAM de mínimo privilégio construída iterativamente + Skill `grant-ci-iam-permission` (Checkpoints 3.8--3.9)
+-   [x] Pipeline Terraform (plan automático em PR + apply automático em merge, com aprovação humana em dois estágios --- Checkpoint 3.10)
+-   [x] Agent → Pull Request (branches, commits e PRs criados pelo Agent via GitHub MCP ao longo de todo o Cenário 3)
+-   [x] Agent → Pipeline (Agent diagnostica falhas de CI a partir dos logs do workflow e corrige iterativamente)
+-   [x] Plan automático
 
 ## Evolução futura
 
@@ -1385,8 +1386,8 @@ O workflow `.github/workflows/terraform.yml` **não foi alterado** neste checkpo
 
 **Checkpoint 3.4 — OK.** Pendências para o pipeline realmente usar essa role:
 
--   [ ] Criar o GitHub Environment `aws-plan` (Settings → Environments) com revisor obrigatório configurado.
--   [ ] Adicionar `permissions: id-token: write`, `environment: aws-plan` e um step `aws-actions/configure-aws-credentials` (`role-to-assume` apontando para a role acima) no workflow.
+-   [x] Criar o GitHub Environment `aws-plan` (Settings → Environments) com revisor obrigatório configurado. — feito.
+-   [x] Adicionar `permissions: id-token: write`, `environment: aws-plan` e um step `aws-actions/configure-aws-credentials` (`role-to-assume` apontando para a role acima) no workflow. — feito; ver Checkpoint 3.6 para o processo de debug até o pipeline autenticar corretamente.
 
 ---
 
@@ -1423,7 +1424,182 @@ A migração copiou o state local existente para o S3 sem tocar em nenhum recurs
 
 ### Status
 
-**Checkpoint 3.5 — OK.** Pendência conhecida: o workflow `.github/workflows/terraform.yml` ainda roda com `terraform init -backend=false` e a policy da role `gh-actions-terraform-plan` só tem leitura sobre o bucket da aplicação — para o pipeline usar de fato este backend remoto, o workflow precisa passar a inicializar com o backend real, e a policy da role precisa ganhar leitura sobre o bucket de estado também.
+**Checkpoint 3.5 — OK.** Pendência conhecida: o workflow `.github/workflows/terraform.yml` ainda roda com `terraform init -backend=false` e a policy da role `gh-actions-terraform-plan` só tem leitura sobre o bucket da aplicação — para o pipeline usar de fato este backend remoto, o workflow precisa passar a inicializar com o backend real, e a policy da role precisa ganhar leitura sobre o bucket de estado também. — resolvido no Checkpoint 3.7.
+
+---
+
+# Checkpoint 3.6 — OIDC: GitHub passou a emitir subject claims imutáveis
+
+Com a role e a trust policy do Checkpoint 3.4 já criadas, faltava efetivamente conectar o workflow a elas. O processo revelou dois problemas em sequência, cada um só visível depois de corrigir o anterior.
+
+### Problema 1 — variável de ambiente nunca configurada
+
+Primeiro erro no pipeline:
+
+```text
+Run aws-actions/configure-aws-credentials@v4
+Error: Credentials could not be loaded, please check your action inputs:
+Could not load credentials from any providers
+```
+
+O workflow usa `role-to-assume: ${{ vars.AWS_ROLE_ARN }}`, mas essa variável de ambiente do GitHub nunca havia sido criada — resolvia para uma string vazia. Correção: `Settings → Environments → aws-plan → Environment variables → AWS_ROLE_ARN` (valor obtido localmente via `aws iam get-role`, nunca commitado no repositório).
+
+### Problema 2 — trust policy não batia com o claim real
+
+Depois de corrigir a variável, novo erro:
+
+```text
+Error: Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity
+```
+
+A trust policy parecia correta (mesmo `sub` documentado no Checkpoint 3.4). Para descobrir a causa raiz sem adivinhar, foi adicionado um step temporário decodificando o JWT OIDC recebido:
+
+```yaml
+- name: Debug OIDC claims
+  run: |
+    curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+      "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
+    | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool
+```
+
+O `sub` real recebido era:
+
+```text
+repo:rafaelvieira96@19826939/mcp-platform-engineering@1332323772:environment:aws-plan
+```
+
+em vez do formato esperado `repo:owner/repo:environment:aws-plan`.
+
+### Descoberta importante — claims de subject imutáveis
+
+Desde 23/04/2026 o GitHub emite, por padrão, subject claims imutáveis para repositórios criados após 15/07/2026: o formato passa a incluir `owner_id`/`repo_id` numéricos (`repo:owner@owner_id/repo@repo_id:...`), justamente para que a claim não continue válida se o repositório for renomeado ou seu namespace reaproveitado por outro dono.
+
+Fontes consultadas: GitHub Changelog ("Immutable subject claims for GitHub Actions OIDC tokens") e a referência OIDC da documentação oficial do GitHub.
+
+### Correção
+
+A trust policy passou a usar o valor literal com os IDs imutáveis, ainda via `StringEquals` (sem `StringLike`/wildcard sobre os IDs — pinning exato é a mitigação recomendada pelo próprio GitHub contra reaproveitamento de namespace):
+
+```text
+"token.actions.githubusercontent.com:sub" = "repo:rafaelvieira96@19826939/mcp-platform-engineering@1332323772:environment:aws-plan"
+```
+
+O step de debug foi removido do workflow assim que a causa raiz foi confirmada.
+
+### Status
+
+**Checkpoint 3.6 — OK.**
+
+---
+
+# Checkpoint 3.7 — Backend S3 real no pipeline de CI
+
+Com a autenticação funcionando, `terraform plan` no CI passou a falhar de outra forma:
+
+```text
+Error: Backend initialization required, please run "terraform init"
+Reason: Initial configuration of the requested backend "s3"
+```
+
+Causa: o workflow ainda rodava `terraform init -backend=false`, herdado do Checkpoint 3.3 (quando não havia backend remoto nenhum) — mas desde o Checkpoint 3.5 `main.tf` declara `backend "s3" {}`.
+
+### Correção
+
+O workflow passou a fazer **dois** `init`s: um inicial com `-backend=false` (permite `fmt`/`validate` sem precisar de credenciais AWS, mantendo o feedback rápido do Checkpoint 3.3), e um segundo, com `-reconfigure` e o backend real, executado só depois da etapa de autenticação AWS:
+
+```yaml
+- name: Terraform Init (S3 backend)
+  run: |
+    terraform init -reconfigure -input=false \
+      -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+      -backend-config="key=mcp-platform-engineering/terraform.tfstate" \
+      -backend-config="region=us-east-1" \
+      -backend-config="encrypt=true" \
+      -backend-config="use_lockfile=true"
+```
+
+O nome do bucket (que embute o account ID da AWS) foi colocado em uma nova variável de ambiente do GitHub, `TF_STATE_BUCKET`, no ambiente `aws-plan` — nunca hardcoded no workflow versionado, seguindo a mesma lógica do `backend.hcl` local (Checkpoint 3.5).
+
+Também foi concedida à role `gh-actions-terraform-plan` permissão de leitura sobre o bucket de estado (`ListBucket`, `GetBucketLocation`, `GetObject` restrito à chave exata do state) — o item pendente já anotado no Checkpoint 3.5.
+
+### Status
+
+**Checkpoint 3.7 — OK.**
+
+---
+
+# Checkpoint 3.8 — IAM de mínimo privilégio: cobertura completa de leitura
+
+Mesmo com a policy de leitura do bucket de estado, `terraform plan` continuou falhando — mas com um padrão diferente: cada execução revelava **um único** `AccessDenied` novo:
+
+```text
+AccessDenied: ... not authorized to perform: iam:GetOpenIDConnectProvider ...
+AccessDenied: ... not authorized to perform: s3:GetBucketAcl ...
+AccessDenied: ... not authorized to perform: s3:GetBucketPolicy ...
+AccessDenied: ... not authorized to perform: iam:ListRolePolicies ...
+AccessDenied: ... not authorized to perform: s3:GetBucketCORS ...
+```
+
+### Descoberta importante — `terraform plan` atualiza todo o state, não só o que mudou
+
+`terraform plan` faz refresh de **todos** os recursos gerenciados no state a cada execução — incluindo os próprios recursos de IAM que definem a role usada pelo pipeline (a role precisa conseguir ler a si mesma). E a função `Read()` de cada tipo de recurso do provider AWS aborta na **primeira** permissão que faltar — então cada execução do CI só revelava a próxima lacuna, uma de cada vez, nunca a lista completa de uma só vez.
+
+Em vez de continuar nesse ciclo, foi pesquisado o conjunto real de chamadas que `aws_s3_bucket` e `aws_iam_role` fazem no `Read()` (documentação do provider + código-fonte, não suposição), e a policy foi ampliada de uma vez:
+
+-   **`aws_s3_bucket`**: 15 ações (`GetBucketAcl`, `GetBucketCORS`, `GetBucketLocation`, `GetBucketLogging`, `GetBucketObjectLockConfiguration`, `GetBucketPolicy`, `GetBucketPublicAccessBlock`, `GetBucketRequestPayment`, `GetBucketTagging`, `GetBucketVersioning`, `GetBucketWebsite`, `GetEncryptionConfiguration`, `GetLifecycleConfiguration`, `GetReplicationConfiguration`, `GetAccelerateConfiguration`, `ListBucket`) — fatoradas em um `locals` compartilhado entre o bucket da aplicação e o bucket de estado, já que ambos precisam do mesmo conjunto.
+-   **Leitura da própria IAM** (role/policies/OIDC provider): `GetRole`, `GetRolePolicy`, `ListRolePolicies`, `ListAttachedRolePolicies`, `GetOpenIDConnectProvider`.
+
+Depois dessa mudança, `terraform plan` no pipeline passou a rodar limpo, sem nenhum `AccessDenied`.
+
+### Status
+
+**Checkpoint 3.8 — OK.**
+
+---
+
+# Checkpoint 3.9 — Skill `grant-ci-iam-permission` + primeiras concessões (SQS, DynamoDB)
+
+Depois de repetir o ciclo "pesquisar a permissão real → aplicar → verificar" várias vezes (Checkpoints 3.6–3.8), o processo foi encapsulado em uma **Skill própria do projeto**: `.claude/skills/grant-ci-iam-permission/SKILL.md`.
+
+A skill documenta o fluxo completo: identificar o tipo de recurso Terraform envolvido; pesquisar (nunca supor) as chamadas reais de API que o provider faz; perguntar explicitamente ao usuário o escopo desejado (somente leitura vs. CRUD completo — nunca assumir, mesmo que o pedido pareça implicar escrita); escopar o ARN pelo prefixo de nomenclatura do projeto (`mcp-platform-engineering-*`, nunca `*` solto); aplicar localmente com credenciais de administrador; verificar de forma independente via `aws iam` (não só confiar no state do Terraform); e só então commitar em uma branch nova — checando antes se a branch usada anteriormente já foi mergeada, já que PRs neste repositório mergeiam quase imediatamente após aprovação.
+
+### Concessão SQS — negociação de escopo
+
+A primeira concessão real de permissão de **escrita** (SQS) expôs um momento importante: o usuário pediu explicitamente que a role permanecesse "estritamente somente leitura, sem create/update/delete/purge" e, uma mensagem depois, pediu o oposto — permissões de escrita para criação de filas SQS. Como essa role é assumida via OIDC por um workflow disparado em `pull_request`, em um repositório público que aceita PR de fork, essa reversão foi tratada como algo que exigia confirmação explícita, não obediência silenciosa. O usuário então especificou o escopo exato desejado — CRUD completo (`CreateQueue`/`SetQueueAttributes`/`DeleteQueue`/`TagQueue`/`UntagQueue`), sem `PurgeQueue`, sem wildcard.
+
+### Concessão DynamoDB — validação da skill
+
+A skill foi testada de ponta a ponta pedindo permissões de DynamoDB para a role. Mesmo o pedido já vindo com "adicione permissões CRUD" explícito, a skill reconfirmou o escopo exato antes de aplicar qualquer coisa — comportamento intencional documentado na própria skill, não uma pergunta redundante. Uma tabela DynamoDB de teste (`mcp-platform-engineering-test-table`, `PROVISIONED`, baseada no exemplo oficial do Terraform Registry) foi adicionada em `dynamodb.tf` para validar as novas permissões através do próprio pipeline de CI, não com credenciais locais.
+
+### Status
+
+**Checkpoint 3.9 — OK.**
+
+---
+
+# Checkpoint 3.10 — Pipeline de Apply com aprovação humana (ambiente `aws-apply`)
+
+Até este ponto o pipeline só executava `terraform plan` — nenhuma alteração real de infraestrutura passava pelo CI. Foi adicionado um segundo job, `terraform-apply`, fechando o ciclo completo de CI/CD.
+
+### Decisões de design
+
+-   **Gatilho**: `apply` roda em `push` para `main` (não em `pull_request`) — só aplica o que já foi de fato mergeado, nunca código especulativo de um PR ainda aberto.
+-   **Aprovação em dois estágios**: um novo GitHub Environment, `aws-apply`, foi criado seguindo o mesmo padrão de `aws-plan` (revisor obrigatório configurado manualmente em Settings → Environments). Isso cria dois portões de aprovação humana: um implícito (revisar e mergear o PR) e um explícito (aprovar o ambiente `aws-apply` antes do `apply` rodar de fato).
+-   **Reaproveitamento da role**: em vez de criar uma segunda role dedicada, a trust policy de `gh-actions-terraform-plan` foi ampliada de um único valor `StringEquals` para uma **lista** de dois valores exatos (`environment:aws-plan` OU `environment:aws-apply`) — ainda sem nenhum wildcard.
+-   **Plano como artefato**: o job de `plan` agora salva o plano (`-out=tfplan`) e sobe como artifact do GitHub Actions (só em execuções de `push`), e o job de `apply` baixa e aplica exatamente esse plano, em vez de gerar um novo — evita divergência entre o que foi revisado e o que é de fato aplicado.
+-   **Permissões mínimas adicionais para `apply`**: escrita no objeto de state (`s3:PutObject`, antes só `GetObject`) e no lock nativo do backend S3 (`<key>.tflock`, exige `GetObject`/`PutObject`/`DeleteObject`, já que `use_lockfile = true` desde o Checkpoint 3.5).
+
+### Decisão deliberada — sem escrita de IAM sobre si mesma
+
+A role **não** recebeu permissão para alterar suas próprias definições de IAM (`iam:PutRolePolicy`, `iam:CreateOpenIDConnectProvider`, etc.). Uma role de CI capaz de reescrever sua própria política é um vetor clássico de auto-escalação de privilégio — especialmente arriscado aqui, dado que o repositório é público e aceita PR de fork. Mudanças em `github_actions_oidc.tf` continuam exigindo `terraform apply` local, com credenciais de administrador, como em todos os checkpoints anteriores.
+
+### Teste de ponta a ponta — criação e destruição
+
+O fluxo completo foi validado nas duas direções: primeiro criando a tabela DynamoDB de teste através do pipeline, depois comentando o recurso inteiro em `dynamodb.tf` (mantendo o código no arquivo, não apagando) para validar também o caminho de **destroy** — `terraform plan` propôs a destruição, e o `apply`, após aprovação no ambiente `aws-apply`, executou a remoção real do recurso.
+
+### Status
+
+**Checkpoint 3.10 — OK.**
 
 ---
 
@@ -1437,16 +1613,4 @@ what has changed since the current local project version.
 Do not modify anything.
 ```
 
-Depois disso, o laboratório segue para operações controladas de escrita via GitHub MCP:
-
-```text
-Claude
-  ↓
-GitHub MCP
-  ↓
-GitHub
-  ↓
-Commit / Branch / Pull Request
-```
-
-E, em seguida, para o restante do Cenário 3 (Pipeline Terraform completo, Agent → Pull Request, Agent → Pipeline, Plan automático).
+Com o Cenário 3 (Pipeline) completo — OIDC funcionando, backend remoto real no CI, IAM de mínimo privilégio construída iterativamente (e encapsulada na Skill `grant-ci-iam-permission`), plan automático em PR e apply automático (com aprovação humana em dois estágios) em merge —, os próximos passos naturais são os itens já listados em "Evolução futura": EKS, Kubernetes MCP, observabilidade, segurança, e a formalização de mais Skills/Commands/Hooks específicos deste laboratório.
