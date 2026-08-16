@@ -152,3 +152,42 @@ resource "aws_iam_role_policy" "terraform_plan_iam_self_read_only" {
     ]
   })
 }
+
+resource "aws_iam_role_policy" "terraform_sqs_read_write" {
+  name = "terraform-sqs-read-write"
+  role = aws_iam_role.gh_actions_terraform_plan.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Minimum set the AWS provider's aws_sqs_queue Read() calls to
+        # plan/refresh a queue: GetQueueAttributes (all queue attributes),
+        # GetQueueUrl (resolve URL from name), ListQueueTags (tags aren't
+        # part of GetQueueAttributes).
+        Sid    = "TerraformSqsReadOnly"
+        Effect = "Allow"
+        Action = [
+          "sqs:GetQueueAttributes",
+          "sqs:GetQueueUrl",
+          "sqs:ListQueueTags",
+        ]
+        Resource = "arn:aws:sqs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:mcp-platform-engineering-*"
+      },
+      {
+        # CRUD set for terraform apply to manage an aws_sqs_queue over its
+        # lifecycle. No PurgeQueue, no wildcard sqs:* action.
+        Sid    = "TerraformSqsReadWrite"
+        Effect = "Allow"
+        Action = [
+          "sqs:CreateQueue",
+          "sqs:SetQueueAttributes",
+          "sqs:DeleteQueue",
+          "sqs:TagQueue",
+          "sqs:UntagQueue",
+        ]
+        Resource = "arn:aws:sqs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:mcp-platform-engineering-*"
+      }
+    ]
+  })
+}
