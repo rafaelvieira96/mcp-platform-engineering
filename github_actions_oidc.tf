@@ -28,10 +28,15 @@ resource "aws_iam_role" "gh_actions_terraform_plan" {
           Federated = aws_iam_openid_connect_provider.github_actions.arn
         }
         Action = "sts:AssumeRoleWithWebIdentity"
+        # Since 2026-07-15 GitHub issues immutable subject claims for repos
+        # created after that date: "repo:OWNER@OWNER_ID/REPO@REPO_ID:...".
+        # Pinning to the literal owner_id/repo_id (rather than StringLike
+        # with a wildcard) keeps this immune to repo/org rename or
+        # ownership-recycling attacks, per GitHub's own guidance.
         Condition = {
           StringEquals = {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-            "token.actions.githubusercontent.com:sub" = "repo:rafaelvieira96/mcp-platform-engineering:environment:aws-plan"
+            "token.actions.githubusercontent.com:sub" = "repo:rafaelvieira96@19826939/mcp-platform-engineering@1332323772:environment:aws-plan"
           }
         }
       }
