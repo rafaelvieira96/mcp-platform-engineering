@@ -191,3 +191,45 @@ resource "aws_iam_role_policy" "terraform_sqs_read_write" {
     ]
   })
 }
+
+resource "aws_iam_role_policy" "terraform_dynamodb_read_write" {
+  name = "terraform-dynamodb-read-write"
+  role = aws_iam_role.gh_actions_terraform_plan.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Minimum set the AWS provider's aws_dynamodb_table Read() calls to
+        # plan/refresh a table: DescribeTable (core attributes), Describe
+        # ContinuousBackups (point_in_time_recovery), DescribeTimeToLive
+        # (ttl block), ListTagsOfResource (tags aren't part of DescribeTable).
+        Sid    = "TerraformDynamodbReadOnly"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:DescribeTable",
+          "dynamodb:DescribeContinuousBackups",
+          "dynamodb:DescribeTimeToLive",
+          "dynamodb:ListTagsOfResource",
+        ]
+        Resource = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/mcp-platform-engineering-*"
+      },
+      {
+        # CRUD set for terraform apply to manage an aws_dynamodb_table over
+        # its lifecycle. No wildcard dynamodb:* action.
+        Sid    = "TerraformDynamodbReadWrite"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:CreateTable",
+          "dynamodb:UpdateTable",
+          "dynamodb:DeleteTable",
+          "dynamodb:TagResource",
+          "dynamodb:UntagResource",
+          "dynamodb:UpdateTimeToLive",
+          "dynamodb:UpdateContinuousBackups",
+        ]
+        Resource = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/mcp-platform-engineering-*"
+      }
+    ]
+  })
+}
