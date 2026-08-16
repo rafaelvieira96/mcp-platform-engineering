@@ -55,6 +55,7 @@ resource "aws_iam_role_policy" "terraform_plan_s3_read_only" {
         Sid    = "TerraformPlanS3ReadOnly"
         Effect = "Allow"
         Action = [
+          "s3:GetBucketAcl",
           "s3:GetBucketLocation",
           "s3:GetBucketPolicy",
           "s3:GetBucketPublicAccessBlock",
@@ -76,10 +77,23 @@ resource "aws_iam_role_policy" "terraform_plan_state_read_only" {
     Version = "2012-10-17"
     Statement = [
       {
+        # terraform plan refreshes every resource declared against this
+        # bucket (aws_s3_bucket + its versioning/encryption/ownership/
+        # public-access-block/lifecycle/policy sub-resources in
+        # state_backend.tf), so this mirrors the read actions each of
+        # those resource types' AWS provider Read() calls.
         Sid    = "TerraformPlanStateBucketReadOnly"
         Effect = "Allow"
         Action = [
+          "s3:GetBucketAcl",
           "s3:GetBucketLocation",
+          "s3:GetBucketOwnershipControls",
+          "s3:GetBucketPolicy",
+          "s3:GetBucketPublicAccessBlock",
+          "s3:GetBucketTagging",
+          "s3:GetBucketVersioning",
+          "s3:GetEncryptionConfiguration",
+          "s3:GetLifecycleConfiguration",
           "s3:ListBucket",
         ]
         Resource = aws_s3_bucket.terraform_state.arn
@@ -93,6 +107,35 @@ resource "aws_iam_role_policy" "terraform_plan_state_read_only" {
         # terraform plan -lock=false never touches the lockfile object, so
         # this is scoped to the state object itself, not the whole bucket.
         Resource = "${aws_s3_bucket.terraform_state.arn}/mcp-platform-engineering/terraform.tfstate"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "terraform_plan_iam_self_read_only" {
+  name = "terraform-plan-iam-self-read-only"
+  role = aws_iam_role.gh_actions_terraform_plan.id
+
+  # terraform plan refreshes every resource in the config, including the
+  # OIDC provider, role, and inline policies this role itself is defined
+  # by — so the role needs read access to its own IAM resources.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "TerraformPlanOIDCProviderReadOnly"
+        Effect   = "Allow"
+        Action   = "iam:GetOpenIDConnectProvider"
+        Resource = aws_iam_openid_connect_provider.github_actions.arn
+      },
+      {
+        Sid    = "TerraformPlanRoleReadOnly"
+        Effect = "Allow"
+        Action = [
+          "iam:GetRole",
+          "iam:GetRolePolicy",
+        ]
+        Resource = aws_iam_role.gh_actions_terraform_plan.arn
       }
     ]
   })
