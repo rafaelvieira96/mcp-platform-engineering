@@ -59,10 +59,19 @@ resource "aws_iam_role" "gh_actions_terraform_plan" {
         # Pinning to the literal owner_id/repo_id (rather than StringLike
         # with a wildcard) keeps this immune to repo/org rename or
         # ownership-recycling attacks, per GitHub's own guidance.
+        #
+        # StringEquals with a list is an exact-match OR (not a wildcard):
+        # this role is assumable from the aws-plan environment (PR plan) or
+        # the aws-apply environment (post-merge apply, gated by required
+        # reviewer approval on that environment) -- no other environment or
+        # ref matches either literal string.
         Condition = {
           StringEquals = {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-            "token.actions.githubusercontent.com:sub" = "repo:rafaelvieira96@19826939/mcp-platform-engineering@1332323772:environment:aws-plan"
+            "token.actions.githubusercontent.com:sub" = [
+              "repo:rafaelvieira96@19826939/mcp-platform-engineering@1332323772:environment:aws-plan",
+              "repo:rafaelvieira96@19826939/mcp-platform-engineering@1332323772:environment:aws-apply",
+            ]
           }
         }
       }
@@ -117,6 +126,40 @@ resource "aws_iam_role_policy" "terraform_plan_state_read_only" {
         # terraform plan -lock=false never touches the lockfile object, so
         # this is scoped to the state object itself, not the whole bucket.
         Resource = "${aws_s3_bucket.terraform_state.arn}/mcp-platform-engineering/terraform.tfstate"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "terraform_apply_state_backend_write" {
+  name = "terraform-apply-state-backend-write"
+  role = aws_iam_role.gh_actions_terraform_plan.id
+
+  # Structural requirement for `terraform apply` against the S3 backend,
+  # independent of which resource types are being managed: it needs to
+  # write the updated state object, and (since use_lockfile = true in
+  # main.tf) acquire/release the native S3 lock via the sibling
+  # "<key>.tflock" object -- per HashiCorp's S3 backend docs, the lock
+  # object needs Get/Put/Delete, the state object itself only needs Put
+  # added on top of the existing read-only Get grant.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "TerraformApplyStateObjectWrite"
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.terraform_state.arn}/mcp-platform-engineering/terraform.tfstate"
+      },
+      {
+        Sid    = "TerraformApplyStateLockReadWrite"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+        ]
+        Resource = "${aws_s3_bucket.terraform_state.arn}/mcp-platform-engineering/terraform.tfstate.tflock"
       }
     ]
   })

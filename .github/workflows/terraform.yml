@@ -4,6 +4,11 @@ on:
   pull_request:
     paths:
       - "**.tf"
+  push:
+    branches:
+      - main
+    paths:
+      - "**.tf"
 
 permissions:
   contents: read
@@ -50,4 +55,55 @@ jobs:
             -backend-config="use_lockfile=true"
 
       - name: Terraform Plan
-        run: terraform plan -input=false -lock=false
+        run: terraform plan -input=false -lock=false -out=tfplan
+
+      # Only needed on push-to-main, so the apply job below applies exactly
+      # what was reviewed here rather than re-planning against whatever
+      # state happens to exist by the time it gets approval.
+      - name: Upload Plan
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+          retention-days: 1
+
+  terraform-apply:
+    name: apply
+    needs: terraform
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: aws-apply
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Terraform Init (S3 backend)
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=mcp-platform-engineering/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform Apply
+        run: terraform apply -input=false tfplan
